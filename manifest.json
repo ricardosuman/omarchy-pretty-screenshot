@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "ricardosuman.pretty-screenshot",
+  "name": "Pretty Screenshot",
+  "version": "1.0.0",
+  "author": "ricardosuman",
+  "license": "MIT",
+  "description": "Replaces the stock screenshot with an Omarchy-styled one: square corners, theme border, soft shadow, over your wallpaper or theme colors.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+
+# omarchy:summary=Take a screenshot and beautify it with a border, shadow and background
+# omarchy:group=capture
+# omarchy:args=[smart|region|windows|fullscreen] [--input <png>] [--output <png>] [--background <wallpaper|gradient|solid|none>] [--no-save] [--no-copy] [--config] | get <key> | set <key> <value> | toggle <key> | --setup | --unsetup
+# omarchy:examples=omarchy-pretty-screenshot region | omarchy-pretty-screenshot --background gradient | omarchy-pretty-screenshot toggle shadow
+
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/pretty-screenshot.json"
+
+# One filter applies every default, so the render path and `get` always agree.
+DEFAULTS='{enabled:true,background:"wallpaper",padding:80,border:true,shadow:true,save_file:true} + with_entries(select(.value != null))'
+
+seed_config() {
+  if [[ -f $CONFIG ]]; then return 0; fi
+  mkdir -p "$(dirname "$CONFIG")"
+  cat >"$CONFIG" <<'JSON'
+{
+  "enabled": true,
+  "background": "wallpaper",
+  "padding": 80,
+  "border": true,
+  "shadow": true,
+  "save_file": true
+}
+JSON
+}
+
+# The type of a key is both the "does this key exist" check and the validator.
+config_key_type() {
+  case "$1" in
+    enabled | border | shadow | save_file) echo bool ;;
+    background) echo background ;;
+    padding) echo padding ;;
+    *) return 1 ;;
+  esac
+}
+
+# Rewrite a single key through a temp file in the same directory, so a crash
+# mid-write can never leave a truncated config and unknown keys survive.
+config_write() {
+  local tmp
+  tmp=$(mktemp "$(dirname "$CONFIG")/.pretty-screenshot.XXXXXX")
+  jq --arg k "$1" --argjson v "$2" '.[$k] = $v' "$CONFIG" >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$CONFIG"
+}
+
+# Config subcommands run before the argument loop, so they can never collide
+# with a capture mode, and they seed the file on first use like every other path.
+case "${1:-}" in
+  get | set | toggle)
+    SUB="$1"
+    KEY="${2:?$1 needs a key}"
+    seed_config
+    TYPE=$(config_key_type "$KEY") || {
+      echo "Unknown config key: $KEY (expected enabled, background, padding, border, shadow or save_file)" >&2
+      exit 1
+    }
+    case "$SUB" in
+      get)
+        VALUE=$(jq -r --arg k "$KEY" "$DEFAULTS | .[\$k]" "$CONFIG")
+        echo "$VALUE"
+        [[ $VALUE != false && $VALUE != null ]] || exit 1
+        ;;
+      set)
+        VALUE="${3:?set needs a value}"
+        case "$TYPE" in
+          bool)
+            if [[ $VALUE != true && $VALUE != false ]]; then
+              echo "Invalid $KEY: $VALUE (expected true or false)" >&2
+              exit 1
+            fi
+            ;;
+          background)
+            case "$VALUE" in
+              wallpaper | gradient | solid | none) VALUE="\"$VALUE\"" ;;
+              *)
+                echo "Invalid background: $VALUE (expected wallpaper, gradient, solid or none)" >&2
+                exit 1
+                ;;
+            esac
+            ;;
+          padding)
+            if [[ ! $VALUE =~ ^[0-9]+$ ]]; then
+              echo "Invalid padding: $VALUE (expected an integer >= 0)" >&2
+              exit 1
+            fi
+            ;;
+        esac
+        config_write "$KEY" "$VALUE"
+        ;;
+      toggle)
+        if [[ $TYPE != bool ]]; then
+          echo "Not a boolean config key: $KEY" >&2
+          exit 1
+        fi
+        if [[ $(jq -r --arg k "$KEY" "$DEFAULTS | .[\$k]" "$CONFIG") == true ]]; then VALUE=false; else VALUE=true; fi
+        config_write "$KEY" "$VALUE"
+        echo "$VALUE"
+        ;;
+    esac
+    exit 0
+    ;;
+esac
+
+# The PRINT keybind and the menu rows live in the user's own config, which
+# `omarchy plugin add` never touches, so the plugin wires itself: Service.qml
+# runs `--setup` whenever the plugin is enabled and `--unsetup` when it is
+# disabled or removed. Both edits go in a marked block, the one thing the
+# plugin is then allowed to take back out.
+PLUGIN_ID="ricardosuman.pretty-screenshot"
+LUA_BEGIN="-- $PLUGIN_ID (begin)"
+LUA_END="-- $PLUGIN_ID (end)"
+MENU_BEGIN="// $PLUGIN_ID (begin)"
+MENU_END="// $PLUGIN_ID (end)"
+
+# The `[ -x ... ]` guard keeps PRINT working with the stock capture if the
+# plugin directory is ever deleted by hand while the block stays behind.
+lua_block() {
+  cat <<'LUA'
+-- ricardosuman.pretty-screenshot (begin)
+hl.unbind("PRINT")
+o.bind("PRINT", "Screenshot", "[ -x ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot ] && exec ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot || exec omarchy-capture-screenshot")
+-- ricardosuman.pretty-screenshot (end)
+LUA
+}
+
+# A replica of the shell's own JSONC reader (MenuModel.js stripJsonc): drop
+# full-line comments, drop trailing commas, then it must parse. A file that
+# fails this makes the shell ignore the *whole* user menu, so nothing is ever
+# written without passing it first. A top-level `items` object would make the
+# shell read only that object, hiding our rows: refuse that file too.
+menu_parses() {
+  sed -E '/^[[:space:]]*\/\//d' "$1" |
+    sed -z -E 's/,([[:space:]]*[]}])/\1/g' |
+    jq -e 'type == "object" and (has("items") | not)' >/dev/null 2>&1
+}
+
+# Insert the block just inside the top-level `{`. Every shipped row ends with a
+# trailing comma the parser strips, so the top is always a valid place to land,
+# and it leaves a later row of the user's own with the same id winning.
+menu_with_block() {
+  awk -v bf="$MENU_BLOCK" '
+    BEGIN { while ((getline line < bf) > 0) block = block (block == "" ? "" : "\n") line }
+    !inserted && $0 !~ /^[[:space:]]*\/\// && (brace = index($0, "{")) > 0 {
+      inserted = 1
+      print substr($0, 1, brace) "\n" block (substr($0, brace + 1) == "" ? "" : "\n" substr($0, brace + 1))
+      next
+    }
+    { print }
+  ' "$1"
+}
+
+# Prints $1 without our block. Fails, printing nothing usable, unless the file
+# holds exactly one begin marker and one end marker in that order: anything
+# else means it was hand-edited, and guessing at the range would eat the
+# user's own lines.
+without_block() {
+  local file="$1" begin="$2" end="$3" mode="$4" b e
+  b=$(grep -nF -- "$begin" "$file" | cut -d: -f1) || true
+  e=$(grep -nF -- "$end" "$file" | cut -d: -f1) || true
+  [[ $b =~ ^[0-9]+$ && $e =~ ^[0-9]+$ && $b -lt $e ]] || return 1
+  # Take back the blank line `--setup` appended ahead of the block.
+  if [[ $mode == lua && $b -gt 1 && -z $(sed -n "$((b - 1))p" "$file") ]]; then b=$((b - 1)); fi
+  sed "${b},${e}d" "$file"
+}
+
+# 0: removed, 1: refused (the file is left alone), 2: nothing of ours in it.
+remove_block() {
+  local file="$1" begin="$2" end="$3" mode="$4" tmp rc=0
+  grep -qF -- "$begin" "$file" 2>/dev/null || return 2
+  tmp=$(mktemp)
+  if without_block "$file" "$begin" "$end" "$mode" >"$tmp" &&
+    { [[ $mode != menu ]] || menu_parses "$tmp"; }; then
+    # Truncate-and-write, never mv: the shell and Hyprland watch these paths,
+    # and a fresh inode can cost them the watch.
+    cat "$tmp" >"$file"
+  else
+    rc=1
+  fi
+  rm -f "$tmp"
+  return $rc
+}
+
+setup() {
+  local changed=0 tmp
+
+  if ! grep -qF -- "$LUA_BEGIN" "$BINDINGS" 2>/dev/null; then
+    mkdir -p -- "$(dirname -- "$BINDINGS")"
+    printf '\n%s\n' "$(lua_block)" >>"$BINDINGS"
+    changed=1
+  fi
+
+  if ! grep -qF -- "$MENU_BEGIN" "$MENU" 2>/dev/null; then
+    mkdir -p -- "$(dirname -- "$MENU")"
+    tmp=$(mktemp)
+    if [[ -f $MENU ]] && sed -E '/^[[:space:]]*\/\//d' "$MENU" | grep -q '{'; then
+      menu_with_block "$MENU" >"$tmp"
+    else
+      { echo '{'; cat "$MENU_BLOCK"; echo '}'; } >"$tmp"
+    fi
+    # The marker check also catches a candidate the awk pass failed to insert
+    # into, which would otherwise parse fine and be rewritten at every start.
+    if grep -qF -- "$MENU_BEGIN" "$tmp" && menu_parses "$tmp"; then
+      cat "$tmp" >"$MENU"
+      changed=1
+      rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      omarchy-notification-send -u critical "Pretty Screenshot could not update the menu" \
+        "Paste omarchy-menu.jsonc by hand (see README)" || true
+      exit 1
+    fi
+  fi
+
+  if [[ $changed == 1 ]]; then
+    omarchy-notification-send "Pretty Screenshot is ready" "PRINT and the Capture menu now use it" || true
+  fi
+}
+
+unsetup() {
+  local changed=0 rc
+
+  # The shell also destroys the service when shell.json is momentarily
+  # unreadable, which is not the user disabling anything. Only disk decides.
+  if ! jq -e --arg id "$PLUGIN_ID" '(.plugins // []) | map(.id) | index($id) | not' \
+    "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1; then
+    echo "pretty-screenshot is still enabled; disable or remove the plugin instead" >&2
+    exit 0
+  fi
+
+  rc=0
+  remove_block "$BINDINGS" "$LUA_BEGIN" "$LUA_END" lua || rc=$?
+  case $rc in
+    0) changed=1 ;;
+    1) omarchy-notification-send -u critical "Pretty Screenshot could not clean up" \
+      "$BINDINGS still has its block; remove it by hand" || true ;;
+  esac
+
+  rc=0
+  remove_block "$MENU" "$MENU_BEGIN" "$MENU_END" menu || rc=$?
+  case $rc in
+    0) changed=1 ;;
+    1) omarchy-notification-send -u critical "Pretty Screenshot could not clean up" \
+      "$MENU still has its block; remove it by hand" || true ;;
+  esac
+
+  if [[ $changed == 1 ]]; then
+    omarchy-notification-send "Pretty Screenshot removed" "PRINT is back to the stock screenshot" || true
+  fi
+}
+
+# The lock lives in the session runtime dir when that dir is really ours, else
+# in a private dir under ~/.cache. Never a predictable name in a shared /tmp,
+# and the lock is the directory itself, opened read only, so nothing can be
+# truncated through a planted symlink.
+lock_dir() {
+  local base="${XDG_RUNTIME_DIR:-}" dir
+  [[ -n $base && ! -L $base && -d $base && $(stat -c '%u %a' "$base") == "$(id -u) 700" ]] || base="$HOME/.cache"
+  dir="$base/pretty-screenshot"
+  mkdir -p -m 700 -- "$dir"
+  [[ ! -L $dir && -d $dir && $(stat -c '%u %a' "$dir") == "$(id -u) 700" ]] ||
+    { printf 'refusing to lock %s: not a private directory of ours\n' "$dir" >&2; exit 1; }
+  printf '%s\n' "$dir"
+}
+
+# Like the config subcommands: `$1` only, before the argument loop, so a
+# capture mode can never collide with them. `--setup` runs at every shell
+# start, so it stays cheap and idempotent; the lock keeps a restart racing a
+# disable from interleaving two rewrites of the same file.
+case "${1:-}" in
+  --setup | --unsetup)
+    BINDINGS="$HOME/.config/hypr/bindings.lua"
+    MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+    MENU_BLOCK="$(dirname "$(readlink -f "$0")")/omarchy-menu.jsonc"
+    LOCK_DIR="$(lock_dir)" || exit 1
+    exec 9<"$LOCK_DIR"
+    flock 9
+    if [[ $1 == --setup ]]; then setup; else unsetup; fi
+    exit 0
+    ;;
+esac
+
+MODE="smart"
+INPUT=""
+OUTPUT=""
+BACKGROUND=""
+NO_SAVE=0
+NO_COPY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    smart | region | windows | fullscreen) MODE="$1" ;;
+    --input) INPUT="${2:?--input needs a path}" && shift ;;
+    --output) OUTPUT="${2:?--output needs a path}" && shift ;;
+    --background) BACKGROUND="${2:?--background needs a mode}" && shift ;;
+    --no-save) NO_SAVE=1 ;;
+    --no-copy) NO_COPY=1 ;;
+    --config)
+      seed_config
+      omarchy-launch-editor "$CONFIG"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# Every failure from here on is silent under `set -e`, and from the PRINT key a
+# silent failure is indistinguishable from a dead binding: say so, and name the
+# raw capture that is still on disk. Conditions (`if`, `||`, `&&`) don't fire an
+# ERR trap, so the best-effort `|| true` guards below stay best-effort.
+trap 'omarchy-notification-send -u critical "Pretty screenshot failed" "${RAW:-}" || true' ERR
+
+seed_config
+read -r ENABLED CONFIG_BG PADDING BORDER_ON SHADOW SAVE < <(jq -r "$DEFAULTS | [.enabled, .background, .padding, .border, .shadow, .save_file] | @tsv" "$CONFIG")
+
+# The master switch makes this a drop-in replacement for the stock command:
+# hand the mode straight back, with the stock notification and nothing of ours.
+# An explicit --input has nothing to capture, so it ignores the switch.
+if [[ $ENABLED != true && -z $INPUT ]]; then
+  exec omarchy-capture-screenshot "$MODE"
+fi
+
+[[ -n $BACKGROUND ]] || BACKGROUND="$CONFIG_BG"
+
+if [[ $NO_SAVE == 1 ]]; then SAVE=false; fi
+if [[ -n $OUTPUT ]]; then SAVE=true; fi
+
+case "$BACKGROUND" in
+  wallpaper | gradient | solid | none) ;;
+  *)
+    echo "Invalid background: $BACKGROUND (expected wallpaper, gradient, solid or none)" >&2
+    exit 1
+    ;;
+esac
+
+TMPDIR_PRETTY=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_PRETTY"' EXIT
+
+# The capture script owns the picker: freeze PID, second-press cancel, cursor
+# handling and the output directory. It prints the raw path, or nothing when
+# the user cancels the selection.
+if [[ -n $INPUT ]]; then
+  RAW="$INPUT"
+  CAPTURED=0
+  SCALE=1
+else
+  RAW=$(omarchy-capture-screenshot "$MODE" save)
+  if [[ -z $RAW ]]; then exit 0; fi
+  CAPTURED=1
+  SCALE=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .scale' 2>/dev/null || true)
+  [[ $SCALE =~ ^[0-9]+(\.[0-9]+)?$ ]] || SCALE=1
+fi
+
+# Hyprland reports the active border as AARRGGBB, optionally followed by more
+# gradient stops and an angle; the first stop is the one that reads as "the"
+# border color.
+GRADIENT=$(hyprctl getoption general:col.active_border -j 2>/dev/null | jq -r '.gradient // empty' 2>/dev/null || true)
+STOP="${GRADIENT%% *}"
+if [[ $STOP =~ ^[0-9a-fA-F]{8}$ ]]; then
+  COLOR="#${STOP:2:6}"
+else
+  COLOR=$(omarchy-theme-color accent "#89b4fa")
+fi
+
+BORDER=$(hyprctl getoption general:border_size -j 2>/dev/null | jq -r '.int // empty' 2>/dev/null || true)
+[[ $BORDER =~ ^[0-9]+$ ]] || BORDER=2
+if [[ $BORDER_ON != true ]]; then BORDER=0; fi
+
+# grim captures physical pixels, so every logical measurement scales with the
+# monitor before it lands on the canvas.
+read -r BW PAD SIGMA OFFSET < <(awk -v s="$SCALE" -v b="$BORDER" -v p="$PADDING" \
+  'BEGIN { printf "%d %d %d %d\n", int(b*s+0.5), int(p*s+0.5), int(20*s+0.5), int(12*s+0.5) }')
+
+# -ping reads the header only; a format that hides its size behind a full
+# decode falls back to the slow read rather than reporting a zero-size canvas.
+read -r W H < <(magick identify -ping -format '%w %h\n' "$RAW[0]")
+if [[ ! $W =~ ^[1-9][0-9]*$ || ! $H =~ ^[1-9][0-9]*$ ]]; then
+  read -r W H < <(magick identify -format '%w %h\n' "$RAW[0]")
+fi
+FW=$((W + 2 * BW + 2 * PAD))
+FH=$((H + 2 * BW + 2 * PAD))
+
+if [[ $BACKGROUND == wallpaper ]]; then
+  WALLPAPER=$(readlink -f "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/background" 2>/dev/null || true)
+  if [[ -z $WALLPAPER || ! -r $WALLPAPER ]] || ! magick identify -ping "$WALLPAPER[0]" &>/dev/null; then
+    echo "No readable theme background; falling back to a solid background" >&2
+    BACKGROUND="solid"
+  fi
+fi
+
+# No jpeg:size hint here: libjpeg only scales by eighths and ImageMagick rounds
+# to the nearest one, so a 2976x1632 wallpaper asked for 804x504 decodes to
+# 744x408 and the cover resize below turns into an upscale. Decoding in full is
+# cheaper than that looks and never softens the background.
+case "$BACKGROUND" in
+  wallpaper) BG_ARGS=("$WALLPAPER" -resize "${FW}x${FH}^" -gravity center -extent "${FW}x${FH}") ;;
+  gradient) BG_ARGS=(-size "${FW}x${FH}" -define gradient:angle=135 "gradient:$(omarchy-theme-color accent "$COLOR")-$(omarchy-theme-color background "#1e1e2e")") ;;
+  solid) BG_ARGS=(-size "${FW}x${FH}" "xc:$(omarchy-theme-color background "#1e1e2e")") ;;
+  none) BG_ARGS=(-size "${FW}x${FH}" xc:none) ;;
+esac
+
+BORDER_ARGS=()
+if [[ $BW -gt 0 ]]; then BORDER_ARGS=(-bordercolor "$COLOR" -border "$BW"); fi
+
+# The shadow is composited onto the fixed-size canvas rather than added to the
+# window, so it can never grow the image or push the window off center.
+#
+# A gaussian costs pixels x sigma, so the silhouette is blurred at 1/DIV scale
+# with sigma/DIV and scaled back to the exact size a full-resolution `-shadow`
+# would have produced: it pads its result by 2*sigma on every side, hence
+# W + 4*sigma. The explicit `!` sizes make that exact whatever the rounding, and
+# DIV=1 leaves both resizes as no-ops for the shadows too small to be worth it.
+SHADOW_ARGS=()
+if [[ $SHADOW == true ]]; then
+  SW=$((W + 2 * BW))
+  SH=$((H + 2 * BW))
+  DIV=1
+  if [[ $SIGMA -ge 8 && $SW -ge 64 && $SH -ge 64 ]]; then DIV=4; fi
+  SHADOW_ARGS=(
+    '(' mpr:win
+    -filter Triangle -resize "$(((SW + DIV / 2) / DIV))x$(((SH + DIV / 2) / DIV))!"
+    -background black -shadow "55x$((SIGMA / DIV))+0+0" +repage
+    -filter Triangle -resize "$((SW + 4 * SIGMA))x$((SH + 4 * SIGMA))!" ')'
+    -gravity center -geometry "+0+${OFFSET}" -composite
+  )
+fi
+
+if [[ $SAVE == true ]]; then
+  if [[ -n $OUTPUT ]]; then
+    FILE="$OUTPUT"
+  elif [[ $CAPTURED == 1 && $(basename "$RAW") =~ ^screenshot-([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2})\.png$ ]]; then
+    FILE="$(dirname "$RAW")/screenshot-pretty-${BASH_REMATCH[1]}.png"
+  elif [[ $CAPTURED == 1 ]]; then
+    FILE="$(dirname "$RAW")/$(basename "$RAW" .png)-pretty.png"
+  else
+    if [[ -f ~/.config/user-dirs.dirs ]]; then source ~/.config/user-dirs.dirs; fi
+    OUTPUT_DIR="${OMARCHY_SCREENSHOT_DIR:-${XDG_PICTURES_DIR:-$HOME/Pictures}}"
+    mkdir -p "$OUTPUT_DIR"
+    FILE="$OUTPUT_DIR/screenshot-pretty-$(date +'%Y-%m-%d_%H-%M-%S').png"
+  fi
+else
+  FILE="$TMPDIR_PRETTY/pretty.png"
+fi
+
+# One invocation: encoding the bordered window and the shadow as intermediate
+# PNGs cost more than every pixel operation in the chain put together, so they
+# stay in memory (mpr:win) and only the result is ever compressed. Level 2 keeps
+# the deflate pass off the critical path for ~20% more bytes.
+magick "$RAW[0]" "${BORDER_ARGS[@]}" +repage -write mpr:win +delete \
+  "${BG_ARGS[@]}" "${SHADOW_ARGS[@]}" \
+  mpr:win -gravity center -geometry +0+0 -composite \
+  -define png:compression-level=2 "$FILE"
+
+# The raw capture is the only copy left if the clipboard write fails and nothing
+# was saved, so it outlives wl-copy.
+if [[ $NO_COPY == 0 ]]; then wl-copy --type image/png <"$FILE"; fi
+if [[ $CAPTURED == 1 ]]; then rm -f "$RAW"; fi
+if [[ $SAVE == true ]]; then echo "$FILE"; fi
+
+if [[ $NO_COPY == 0 && $SAVE == true ]]; then
+  HEADLINE="Pretty screenshot copied to clipboard and saved"
+elif [[ $NO_COPY == 0 ]]; then
+  HEADLINE="Pretty screenshot copied to clipboard"
+elif [[ $SAVE == true ]]; then
+  HEADLINE="Pretty screenshot saved"
+else
+  HEADLINE=""
+fi
+
+# Best-effort: the screenshot is already on the clipboard or on disk, so a
+# notification outage must not report the capture itself as failed.
+if [[ -n $HEADLINE && $SAVE == true ]]; then
+  omarchy-notification-send "$HEADLINE" "Edit with Super + Alt + , (or click this)" \
+    --image "$FILE" \
+    --exec "${OMARCHY_SCREENSHOT_EDITOR:-tensaku-edit}" "$FILE" || true
+elif [[ -n $HEADLINE ]]; then
+  omarchy-notification-send "$HEADLINE" || true
+fi
+
+exit 0
