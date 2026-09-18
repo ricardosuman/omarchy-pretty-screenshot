@@ -116,13 +116,15 @@ LUA_END="-- $PLUGIN_ID (end)"
 MENU_BEGIN="// $PLUGIN_ID (begin)"
 MENU_END="// $PLUGIN_ID (end)"
 
-# The `[ -x ... ]` guard keeps PRINT working with the stock capture if the
-# plugin directory is ever deleted by hand while the block stays behind.
+# The `test -x` guard keeps PRINT working with the stock capture if the
+# plugin directory is ever deleted by hand while the block stays behind. Not
+# `[ -x ]`: Hyprland reads a leading `[...]` in an exec as window rules and
+# drops it, which leaves `&& exec ...` and a PRINT that does nothing.
 lua_block() {
   cat <<'LUA'
 -- ricardosuman.pretty-screenshot (begin)
 hl.unbind("PRINT")
-o.bind("PRINT", "Screenshot", "[ -x ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot ] && exec ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot || exec omarchy-capture-screenshot")
+o.bind("PRINT", "Screenshot", "test -x ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot && exec ~/.config/omarchy/plugins/ricardosuman.pretty-screenshot/omarchy-pretty-screenshot || exec omarchy-capture-screenshot")
 -- ricardosuman.pretty-screenshot (end)
 LUA
 }
@@ -186,6 +188,13 @@ remove_block() {
 
 setup() {
   local changed=0 tmp
+
+  # A block from an older version (the broken `[ -x ]` one): take it out, so
+  # the current one goes in below.
+  if grep -qF -- "$LUA_BEGIN" "$BINDINGS" 2>/dev/null &&
+    [[ $(sed -n "/$PLUGIN_ID (begin)/,/$PLUGIN_ID (end)/p" "$BINDINGS") != "$(lua_block)" ]]; then
+    remove_block "$BINDINGS" "$LUA_BEGIN" "$LUA_END" lua || true
+  fi
 
   if ! grep -qF -- "$LUA_BEGIN" "$BINDINGS" 2>/dev/null; then
     mkdir -p -- "$(dirname -- "$BINDINGS")"
